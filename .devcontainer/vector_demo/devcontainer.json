@@ -1,20 +1,17 @@
 {
   "name": "Elastic Vector Search Demo",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  
-  // 💡 수정된 부분: Codespaces 컨테이너 내부의 정확한 마운트 경로 지정
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}/vector_demo",
-  
   "customizations": {
     "vscode": {
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/bin/python"
       },
       "extensions": [
-        "ms-python.python"
+        "ms-python.python",
+        "ms-toolsai.jupyter"    // 🔥 Jupyter 익스텐션 추가
       ]
     }
   },
-  
   "postCreateCommand": "pip install -r requirements.txt"
 }
