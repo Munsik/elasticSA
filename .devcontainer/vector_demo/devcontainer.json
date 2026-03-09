@@ -2,7 +2,8 @@
   "name": "Elastic Vector Search Demo",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
   
-  "workspaceFolder": "${localWorkspaceFolder}/vector_demo",
+  // 💡 수정된 부분: Codespaces 컨테이너 내부의 정확한 마운트 경로 지정
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}/vector_demo",
   
   "customizations": {
     "vscode": {
