@@ -1,0 +1,21 @@
+{
+  "name": "Elastic Vector Search Demo",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  
+  // 💡 핵심: Codespaces가 열릴 때 자동으로 vector_demo 폴더로 진입합니다.
+  "workspaceFolder": "${localWorkspaceFolder}/vector_demo",
+  
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      },
+      "extensions": [
+        "ms-python.python"
+      ]
+    }
+  },
+  
+  // 작업 디렉토리가 vector_demo로 지정되었으므로, 바로 requirements.txt를 읽을 수 있습니다.
+  "postCreateCommand": "pip install -r requirements.txt"
+}
