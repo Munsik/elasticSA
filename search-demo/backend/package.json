@@ -1,0 +1,19 @@
+{
+  "name": "search-demo-backend",
+  "version": "1.0.0",
+  "description": "Elastic Observability & Hybrid Search PoV - Backend",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --import ./instrument.mjs src/index.js",
+    "dev":   "node --watch --import ./instrument.mjs src/index.js"
+  },
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.13.0",
+    "@faker-js/faker": "^8.4.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "elastic-apm-node": "^4.7.0",
+    "express": "^4.19.2"
+  }
+}

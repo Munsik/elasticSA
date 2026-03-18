@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Elasticsearch highlight — <em> 태그 스타일 */
+em {
+  background-color: #fef08a; /* yellow-200 */
+  font-style: normal;
+  font-weight: 600;
+  border-radius: 2px;
+  padding: 0 2px;
+}
