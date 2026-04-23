@@ -42,7 +42,6 @@ const es = new Client({
 });
 
 // Kibana 베이스 URL (Cloud ID에서 추출 또는 직접 지정)
-// Cloud ID 형식: "name:base64" → base64 디코딩하면 호스트 정보가 나옴
 const KIBANA_URL = process.env.KIBANA_URL
   || (() => {
       try {
@@ -50,8 +49,8 @@ const KIBANA_URL = process.env.KIBANA_URL
         if (!b64) return null;
         const decoded  = Buffer.from(b64, 'base64').toString('utf-8');
         // 디코딩 형식: "host:port$es_uuid$kibana_uuid"
-        const [hostPort] = decoded.split('$');
-        return `https://${hostPort}`;
+        const [hostPort, , kibanaUuid] = decoded.split('$');
+        return `https://${kibanaUuid}.${hostPort}`;
       } catch {
         return null;
       }
@@ -63,12 +62,6 @@ const KIBANA_URL = process.env.KIBANA_URL
 
 /**
  * Kibana Agent Builder 전용 헤더
- *
- * KIBANA_CHAT_API_KEY가 설정된 경우 해당 키를 사용한다.
- * 이 키는 enterprise-knowledge 인덱스 read 권한과 Kibana Agent Builder
- * 기능 권한만을 가진 최소 권한 API 키여야 한다.
- *
- * KIBANA_CHAT_API_KEY가 비어 있으면 ES_API_KEY를 폴백으로 사용한다.
  */
 function kibanaHeaders() {
   const apiKey = process.env.KIBANA_CHAT_API_KEY?.trim() || process.env.ES_API_KEY;
@@ -81,29 +74,15 @@ function kibanaHeaders() {
 
 /**
  * ES|QL 문자열 리터럴 이스케이프
- * ES|QL에서 문자열은 큰따옴표로 감싸므로 쿼리 텍스트 내 " 와 \ 를 이스케이프한다.
- * 이를 통해 쿼리 인젝션(ES|QL injection)을 방지한다.
- *
- * @param  {string} text  원본 검색어
- * @returns {string}      ES|QL 문자열 리터럴 안에 안전하게 삽입 가능한 텍스트
  */
 function esqlEscape(text) {
   return text
-    .replace(/\\/g, '\\\\')   // 백슬래시를 먼저 이스케이프
-    .replace(/"/g,  '\\"');   // 큰따옴표 이스케이프
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g,  '\\"');
 }
 
 /**
  * ES|QL 응답(컬럼/값 테이블 형식)을 /api/search 표준 hits 배열로 변환
- *
- * ES|QL 응답 구조:
- *   { columns: [{name, type}], values: [[v1, v2, ...], ...] }
- *
- * 변환 결과:
- *   [{ score, title, content, ... }, ...]
- *
- * @param  {{ columns: Array, values: Array }} esqlResult
- * @returns {Array<Object>}
  */
 function esqlToHits(esqlResult) {
   const colNames = esqlResult.columns.map((c) => c.name);
@@ -116,10 +95,8 @@ function esqlToHits(esqlResult) {
       const key = name === '_score' ? 'score' : name === 'content_text' ? 'content' : name;
       hit[key] = row[i];
     });
-    // ES|QL은 highlight를 지원하지 않음
     hit.highlight = {};
 
-    // 동일 title 중복 제거 (ES|QL은 collapse 미지원)
     if (!seen.has(hit.title)) {
       seen.add(hit.title);
       hits.push(hit);
@@ -137,8 +114,8 @@ app.get('/api/health', async (req, res) => {
     res.json({
       status: 'ok',
       elasticsearch: { version: info.version.number, cluster: info.cluster_name },
-      kibana_url: KIBANA_URL || '(not configured)',
-      apm_active: apm.isStarted(),
+      kibana_url:    KIBANA_URL || '(not configured)',
+      apm_active:    apm.isStarted(),
     });
   } catch (err) {
     apm.captureError(err);
@@ -149,20 +126,6 @@ app.get('/api/health', async (req, res) => {
 // =============================================================================
 // 7. /api/search  — Lexical / Vector / Hybrid 검색
 // =============================================================================
-/**
- * POST /api/search
- *
- * Body:
- *   query      {string}  검색어 (필수)
- *   searchType {string}  'lexical' | 'vector' | 'hybrid'  (기본: 'hybrid')
- *   index      {string}  대상 인덱스 (기본: 'search-demo')
- *   size       {number}  반환 건수   (기본: 10)
- *
- * Response:
- *   took   {number}  ES 응답 소요시간 (ms)
- *   total  {number}  전체 매칭 건수
- *   hits   {Array}   검색 결과 (score, highlight 포함)
- */
 app.post('/api/search', async (req, res) => {
   const {
     query,
@@ -175,9 +138,7 @@ app.post('/api/search', async (req, res) => {
     return res.status(400).json({ error: '검색어(query)는 필수입니다.' });
   }
 
-  // APM 커스텀 스팬: Kibana APM UI > Transactions 에서 확인 가능
   const span = apm.startSpan(`search:${searchType}`, 'elasticsearch');
-  // APM 커스텀 레이블: 검색 유형별 성능 비교에 활용
   apm.setLabel('search.type', searchType);
   apm.setLabel('search.query', query.slice(0, 100));
 
@@ -185,10 +146,6 @@ app.post('/api/search', async (req, res) => {
 
     // ------------------------------------------------------------------
     // 7-A. Lexical Search (BM25 multi_match — Query DSL)
-    //      title(text) + content_text(text) 두 필드를 대상으로 BM25 검색.
-    //      content_text는 semantic_text인 content와 동일한 원문을 text 타입으로
-    //      저장한 필드로, lexical/vector/hybrid 모두 동일 본문 데이터를 대상으로
-    //      검색할 수 있도록 한다.
     // ------------------------------------------------------------------
     if (searchType === 'lexical') {
       const queryDsl = {
@@ -216,7 +173,6 @@ app.post('/api/search', async (req, res) => {
         },
       };
 
-      // setCustomContext: 레이블(1024자 제한)과 달리 길이 제한 없이 전체 쿼리 저장
       apm.setCustomContext({ search_query_dsl: JSON.stringify(queryDsl, null, 2) });
 
       const result = await es.search(queryDsl);
@@ -240,10 +196,7 @@ app.post('/api/search', async (req, res) => {
     }
 
     // ------------------------------------------------------------------
-    // 7-B. Vector Search (Semantic — semantic_text 필드)
-    //      content 필드(semantic_text)를 대상으로 semantic 쿼리 실행.
-    //      content 필드는 lexical의 content_text와 동일한 문서 본문 데이터를
-    //      의미론적으로 인덱싱한 것이므로 동일 데이터 대상 검색.
+    // 7-B. Vector Search (Semantic — semantic_text 필드 / Jina v5 embedding)
     // ------------------------------------------------------------------
     if (searchType === 'vector') {
       const queryDsl = {
@@ -284,22 +237,17 @@ app.post('/api/search', async (req, res) => {
     }
 
     // ------------------------------------------------------------------
-    // 7-C. Hybrid Search — ES|QL FORK / FUSE / RERANK
+    // 7-C. Hybrid Search — ES|QL FORK / FUSE / RERANK (Jina v5 reranker)
     //
     //  파이프라인 구조:
     //    1) FROM ... METADATA _id, _index, _score
     //    2) FORK — 검색 방식별 독립 실행
     //         branch 1: BM25 on title       (제목 키워드 매칭)
     //         branch 2: BM25 on content_text (본문 키워드 매칭)
-    //         branch 3: Semantic on content  (semantic_text 의미론적 매칭)
+    //         branch 3: Semantic on content  (Jina v5 의미론적 매칭)
     //    3) FUSE — RRF(Reciprocal Rank Fusion)으로 세 브랜치 결과 병합
-    //    4) RERANK — Jina cross-encoder로 최종 재정렬
+    //    4) RERANK — Jina v5 cross-encoder로 최종 재정렬
     //    5) SORT _score DESC | LIMIT size | KEEP 필요 필드
-    //
-    //  ※ FORK/FUSE는 각 브랜치를 독립 실행 후 RRF 병합 → OR 단일 쿼리 대비
-    //     더 균형 잡힌 lexical+semantic 결과 생성
-    //  ※ ES|QL은 highlight 미지원 → hit.highlight는 빈 객체
-    //  ※ ES|QL 응답은 { columns, values } 테이블 형식 → esqlToHits()로 변환
     // ------------------------------------------------------------------
     const safeQuery = esqlEscape(query);
 
@@ -316,16 +264,12 @@ app.post('/api/search', async (req, res) => {
       `| KEEP _score, title, content_text, category, department, author, status, created_at`,
     ].join('\n');
 
-    // setCustomContext: 길이 제한 없이 전체 ES|QL 쿼리 저장
-    // Kibana APM > Transaction > Custom 탭에서 search_esql_query 필드로 확인
     apm.setCustomContext({ search_esql_query: esqlQuery });
 
     const result = await es.esql.query({ query: esqlQuery });
 
     return res.json({
-      // ES|QL 응답의 took (ms)
       took:  result.took ?? 0,
-      // ES|QL은 total 개념이 없음 — 실제 반환 행 수로 대체
       total: result.values?.length ?? 0,
       hits:  esqlToHits(result),
     });
@@ -340,40 +284,22 @@ app.post('/api/search', async (req, res) => {
 
 // =============================================================================
 // 8. /api/chat  — Elastic Agent Builder Converse API
+//
+// APM 계측 구조:
+//   span: chat:agent-builder-converse   ← 전체 트랜잭션 (기존 유지)
+//   span: chat:kibana-agent-fetch       ← fetch() 호출 ~ 응답 헤더 수신까지
+//                                          (네트워크 레이턴시 + Agent 라우팅 시간)
+//   span: chat:llm-ttfb                 ← SSE 첫 번째 텍스트 chunk 수신까지
+//                                          (LLM이 첫 토큰을 생성하는 데 걸린 시간)
+//   span: chat:stream-relay             ← SSE 스트림 중계 전체 구간
+//                                          (첫 chunk ~ done 이벤트까지)
+//   label: chat.ttfb_ms                 ← TTFB ms (숫자, KQL 필터 및 대시보드 집계 가능)
+//   label: chat.total_generation_ms     ← 전체 생성 완료까지 ms
+//
+// Kibana APM > Transactions > POST /api/chat > Timeline에서 span 계층 확인 가능
 // =============================================================================
-/**
- * POST /api/chat
- *
- * Kibana Agent Builder의 "search-demo" 에이전트를 호출한다.
- * converse-async 엔드포인트를 사용해 SSE 스트림을 프론트엔드로 중계한다.
- *
- * 참고: https://www.elastic.co/docs/api/doc/kibana/operation/operation-post-agent-builder-converse
- *
- * Body:
- *   input           {string}  사용자 메시지 (필수)
- *   conversation_id {string}  이전 대화 ID (선택 — 멀티턴 대화 유지)
- *
- * Response (SSE):
- *   event: chunk  → { text: string }          LLM 응답 텍스트 청크
- *   event: done   → { conversation_id: string, steps: Array }  완료
- *   event: error  → { message: string }        오류
- *
- * Kibana Agent Builder Converse 응답 구조 (동기):
- *   {
- *     response:        { message: string },
- *     conversation_id: string,
- *     steps:           [{ type, reasoning, tool_id, params, results }]
- *   }
- *
- * 스트리밍 방식:
- *   - converse-async: SSE 스트림 직접 반환 (Kibana → Backend → Frontend 중계)
- *   - converse:       동기 응답 → 단일 SSE 이벤트로 래핑
- *   현재는 converse (동기) 방식을 사용하고 응답을 SSE로 전달한다.
- *   스트리밍이 필요하면 아래 ENDPOINT 상수를 'converse-async'로 변경하면 된다.
- */
-const AGENT_ID       = 'search-demo';
-const CONVERSE_PATH  = '/api/agent_builder/converse';        // 동기 응답
-// const CONVERSE_PATH = '/api/agent_builder/converse-async'; // SSE 스트리밍
+const AGENT_ID      = 'search-demo';
+const CONVERSE_PATH = '/api/agent_builder/converse';
 
 app.post('/api/chat', async (req, res) => {
   const { input, conversation_id } = req.body;
@@ -382,7 +308,6 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'input은 필수입니다.' });
   }
 
-  // SSE 헤더 설정 (동기/비동기 모두 동일한 인터페이스로 프론트에 전달)
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
@@ -392,6 +317,7 @@ app.post('/api/chat', async (req, res) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
+  // ① 최상위 span — 전체 /api/chat 요청 구간 (기존 유지)
   const span = apm.startSpan('chat:agent-builder-converse', 'external');
   apm.setLabel('chat.agent_id',       AGENT_ID);
   apm.setLabel('chat.input_length',   input.length);
@@ -402,26 +328,16 @@ app.post('/api/chat', async (req, res) => {
       throw new Error('KIBANA_URL이 설정되지 않았습니다. .env를 확인하세요.');
     }
 
-    // ------------------------------------------------------------------
-    // Agent Builder Converse API 호출
-    //
-    // POST {KIBANA_URL}/api/agent_builder/converse
-    // Headers:
-    //   Authorization: ApiKey {ES_API_KEY}
-    //   kbn-xsrf: true
-    //   Content-Type: application/json
-    //
-    // Body:
-    //   input           - 사용자 입력 (현재 메시지)
-    //   agent_id        - "search-demo" (Agent Builder에서 생성한 에이전트 ID)
-    //   conversation_id - 이전 턴의 conversation_id (멀티턴 유지)
-    // ------------------------------------------------------------------
     const requestBody = {
       input,
       agent_id: AGENT_ID,
       ...(conversation_id && { conversation_id }),
     };
 
+    // ② Kibana Agent 호출 ~ 응답 헤더 수신까지
+    //    fetch()가 resolve되는 시점 = HTTP 응답 헤더를 받은 시점 (body 수신 전)
+    //    → 네트워크 레이턴시 + Kibana Agent 라우팅/인증 시간을 분리해서 측정
+    const spanFetch = apm.startSpan('chat:kibana-agent-fetch', 'external', 'http');
     const agentResponse = await fetch(
       `${KIBANA_URL}${CONVERSE_PATH}`,
       {
@@ -430,6 +346,7 @@ app.post('/api/chat', async (req, res) => {
         body:    JSON.stringify(requestBody),
       }
     );
+    spanFetch?.end();
 
     if (!agentResponse.ok) {
       const errText = await agentResponse.text();
@@ -438,14 +355,21 @@ app.post('/api/chat', async (req, res) => {
 
     const contentType = agentResponse.headers.get('content-type') || '';
 
-    // ------------------------------------------------------------------
-    // 8-A. converse-async 사용 시: Kibana SSE 스트림을 프론트로 직접 중계
-    // ------------------------------------------------------------------
+    // 8-A. converse-async: SSE 스트림 직접 중계
     if (contentType.includes('text/event-stream')) {
       const reader  = agentResponse.body.getReader();
       const decoder = new TextDecoder();
       let   buffer  = '';
       let   finalConversationId = conversation_id || null;
+
+      // ③ SSE 스트림 중계 전체 구간
+      const spanStream = apm.startSpan('chat:stream-relay', 'external');
+
+      // ④ LLM TTFB — SSE 스트림 시작 ~ 첫 번째 텍스트 chunk 수신까지
+      //    Agent 내부의 retrieval + LLM prefill 시간을 반영한다.
+      let spanTTFB         = apm.startSpan('chat:llm-ttfb', 'external');
+      let firstChunkTime   = null;
+      const streamStartTime = Date.now();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -453,7 +377,7 @@ app.post('/api/chat', async (req, res) => {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop();   // 마지막 불완전 줄 버퍼 보관
+        buffer = lines.pop();
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -461,16 +385,25 @@ app.post('/api/chat', async (req, res) => {
           if (raw === '[DONE]') continue;
           try {
             const chunk = JSON.parse(raw);
-            // 응답 텍스트 청크 중계
+
             if (chunk.response?.message) {
+              // ④ 첫 번째 실제 텍스트 chunk 수신 시점에 TTFB span 종료
+              if (spanTTFB) {
+                firstChunkTime = Date.now();
+                apm.setLabel('chat.ttfb_ms', firstChunkTime - streamStartTime);
+                spanTTFB.end();
+                spanTTFB = null;
+              }
               sendEvent('chunk', { text: chunk.response.message });
             }
-            // conversation_id 수집 (마지막 청크에 포함될 수 있음)
+
             if (chunk.conversation_id) {
               finalConversationId = chunk.conversation_id;
             }
-            // 종료 신호
+
             if (chunk.done === true || chunk.finished === true) {
+              // ⑤ 생성 완료 시점 — 전체 생성 소요 시간을 label로 기록
+              apm.setLabel('chat.total_generation_ms', Date.now() - streamStartTime);
               sendEvent('done', {
                 conversation_id: finalConversationId,
                 steps: chunk.steps ?? [],
@@ -482,20 +415,26 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-    // ------------------------------------------------------------------
-    // 8-B. converse (동기) 사용 시: 응답을 SSE 단일 이벤트로 래핑
-    //      응답 구조: { response: { message }, conversation_id, steps[] }
-    // ------------------------------------------------------------------
-    } else {
-      const body = await agentResponse.json();
+      // TTFB span이 닫히지 않은 채로 스트림이 종료된 경우 (텍스트 chunk 없이 done만 온 경우)
+      if (spanTTFB) {
+        spanTTFB.end();
+        spanTTFB = null;
+      }
 
-      // 응답 메시지를 청크 단위로 전송 (프론트 타이핑 효과)
+      spanStream?.end();
+
+    // 8-B. converse (동기): 응답을 SSE 단일 이벤트로 래핑
+    } else {
+      const body    = await agentResponse.json();
       const message = body.response?.message ?? '';
-      const CHUNK   = 30;   // 한 번에 전송할 글자 수
+      const CHUNK   = 30;
+
+      // 동기 응답은 body 수신 완료 시점이 곧 TTFB이므로 label만 기록
+      apm.setLabel('chat.ttfb_ms',             0);
+      apm.setLabel('chat.total_generation_ms', 0);
 
       for (let i = 0; i < message.length; i += CHUNK) {
         sendEvent('chunk', { text: message.slice(i, i + CHUNK) });
-        // 타이핑 효과: 너무 빠르면 0ms, 적당히 느리게 하려면 10~20ms
         await new Promise((r) => setTimeout(r, 10));
       }
 
@@ -515,23 +454,122 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // =============================================================================
-// 9. /api/seed  — 테스트 데이터 인덱싱 (lexical 전용 인덱스)
-//    semantic 검색까지 테스트하려면 인덱스에 semantic_text 필드가 필요함.
-//    Kibana Dev Tools에서 아래 매핑을 먼저 생성하세요:
+// 9. /api/analytics/event  — 검색 행동 이벤트 수집 (자체 인덱스 방식)
 //
-//    PUT search-demo
-//    {
-//      "mappings": {
-//        "properties": {
-//          "title":            { "type": "text" },
-//          "content":          { "type": "text" },
-//          "content_semantic": { "type": "semantic_text" },  ← ELSER/E5 자동 임베딩
-//          "tags":             { "type": "keyword" },
-//          "category":         { "type": "keyword" },
-//          "created_at":       { "type": "date" }
-//        }
-//      }
-//    }
+// ※ Elastic Behavioral Analytics는 9.0에서 deprecated / Kibana UI 제거됨.
+//    (Kibana 9.0 Breaking Changes 공식 확인)
+//    대체 방식: ES 클라이언트로 전용 인덱스에 직접 저장 → Kibana Dashboard로 시각화
+//
+// 수집 이벤트:
+//   - search : 검색 실행 시점 (쿼리, 검색 방식, 결과 수, 상위 문서 목록)
+//   - click  : 검색 결과 문서 클릭 시점 (문서 ID, 검색어, 클릭 순위)
+//
+// 저장 인덱스: rws-search-events-YYYY-MM  (월별 자동 롤오버)
+//   → Kibana > Stack Management > Data Views 에서 패턴 "rws-search-events-*" 등록
+//   → 이후 Dashboard에서 아래 분석 가능:
+//       · 인기 검색어 Top N (terms agg on search.query)
+//       · Zero-result 쿼리 (filter: results.total_results == 0)
+//       · 클릭률 CTR (search 이벤트 수 대비 click 이벤트 수)
+//       · 검색 방식별 클릭 분포 (terms agg on search.search_type)
+//       · 시간대별 검색량 추이 (date_histogram on @timestamp)
+//
+// .env 추가 항목 없음 — ES_CLOUD_ID / ES_API_KEY 기존 설정 그대로 사용
+// =============================================================================
+
+// 월별 롤오버 인덱스명 생성 헬퍼
+function analyticsIndex() {
+  const ym = new Date().toISOString().slice(0, 7); // "YYYY-MM"
+  return `rws-search-events-${ym}`;
+}
+
+// 인덱스 최초 생성 시 매핑 정의 (최초 1회만 실행됨)
+async function ensureAnalyticsIndex(index) {
+  const exists = await es.indices.exists({ index });
+  if (exists) return;
+
+  await es.indices.create({
+    index,
+    mappings: {
+      properties: {
+        '@timestamp':  { type: 'date' },
+        event_type:    { type: 'keyword' },            // 'search' | 'click'
+        session_id:    { type: 'keyword' },            // 탭 단위 세션 ID
+        search: {
+          properties: {
+            query:        { type: 'text',
+                            fields: { keyword: { type: 'keyword', ignore_above: 256 } } },
+            search_type:  { type: 'keyword' },         // 'lexical' | 'vector' | 'hybrid'
+            total_results:{ type: 'integer' },
+          },
+        },
+        document: {
+          properties: {
+            id:    { type: 'keyword' },
+            index: { type: 'keyword' },
+          },
+        },
+        click_rank: { type: 'integer' },               // 클릭된 문서의 검색 결과 순위 (1-based)
+      },
+    },
+    settings: {
+      number_of_shards:   1,
+      number_of_replicas: 1,
+    },
+  });
+}
+
+app.post('/api/analytics/event', async (req, res) => {
+  const { eventType, payload } = req.body;
+
+  if (!['search', 'click'].includes(eventType)) {
+    return res.status(400).json({ error: 'eventType은 "search" 또는 "click"이어야 합니다.' });
+  }
+
+  const span = apm.startSpan(`analytics:${eventType}`, 'elasticsearch');
+  apm.setLabel('analytics.event_type', eventType);
+  apm.setLabel('analytics.query',      payload?.search?.query?.slice(0, 100) ?? '');
+
+  try {
+    const index = analyticsIndex();
+
+    // 인덱스 없으면 매핑과 함께 생성 (비동기, 실패해도 이벤트 저장 계속 시도)
+    await ensureAnalyticsIndex(index).catch(() => {});
+
+    // 플랫 구조로 정규화하여 저장 — Kibana 집계/필터 쿼리 용이성 우선
+    const doc = {
+      '@timestamp':   new Date().toISOString(),
+      event_type:     eventType,
+      session_id:     payload?.session?.id ?? null,
+
+      // search 공통 필드
+      'search.query':        payload?.search?.query        ?? null,
+      'search.search_type':  payload?.search?.search_type  ?? null,
+      'search.total_results':
+        eventType === 'search'
+          ? (payload?.search?.results?.total_results ?? 0)
+          : null,
+
+      // click 전용 필드
+      'document.id':    eventType === 'click' ? (payload?.document?.id    ?? null) : null,
+      'document.index': eventType === 'click' ? (payload?.document?.index ?? null) : null,
+      click_rank:       eventType === 'click' ? (payload?.page?.current   ?? null) : null,
+    };
+
+    await es.index({ index, document: doc });
+
+    res.json({ ok: true });
+
+  } catch (err) {
+    apm.captureError(err);
+    // Analytics 실패는 검색 UX에 영향을 주면 안 되므로 200 반환
+    res.json({ ok: false, error: err.message });
+  } finally {
+    span?.end();
+  }
+});
+
+// =============================================================================
+// 10. /api/seed  — 테스트 데이터 인덱싱
 // =============================================================================
 app.post('/api/seed', async (req, res) => {
   const { count = 50, index = 'search-demo' } = req.body;
@@ -540,7 +578,6 @@ app.post('/api/seed', async (req, res) => {
   try {
     const { faker } = await import('@faker-js/faker');
 
-    // 인덱스가 없으면 기본 매핑으로 생성 (semantic_text 없이 lexical 전용)
     const exists = await es.indices.exists({ index });
     if (!exists) {
       await es.indices.create({
@@ -587,10 +624,11 @@ app.post('/api/seed', async (req, res) => {
 });
 
 // =============================================================================
-// 10. 서버 시작
+// 11. 서버 시작
 // =============================================================================
 app.listen(PORT, () => {
   console.log(`\n🚀 Backend: http://localhost:${PORT}`);
   console.log(`   APM:     ${apm.isStarted() ? process.env.APM_SERVER_URL : '비활성화'}`);
-  console.log(`   Kibana:  ${KIBANA_URL || '(KIBANA_URL 미설정 — Cloud ID 자동 감지 실패)'}\n`);
+  console.log(`   Kibana:  ${KIBANA_URL || '(KIBANA_URL 미설정 — Cloud ID 자동 감지 실패)'}`);
+  console.log(`   Analytics Index: rws-search-events-YYYY-MM (월별 자동 생성)\n`);
 });

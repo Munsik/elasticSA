@@ -2,7 +2,20 @@ import { useState, useRef, useEffect } from 'react';
 import { Search, Zap, Database, Brain, Send, X, MessageSquare, ChevronDown, BarChart3, Star, Bug, AlertTriangle, CheckCircle } from 'lucide-react';
 import { apm } from '@elastic/apm-rum';
 import ReactMarkdown from 'react-markdown';
-import { search } from '../api/search';
+import { search, sendAnalyticsEvent } from '../api/search';
+
+// =============================================================================
+// 세션 ID 헬퍼 — 탭 단위로 유지 (sessionStorage 기반)
+// Behavioral Analytics에서 동일 세션 내 검색 → 클릭 흐름을 추적하는 데 사용됩니다.
+// =============================================================================
+function getSessionId() {
+  let sid = sessionStorage.getItem('ba_session_id');
+  if (!sid) {
+    sid = crypto.randomUUID();
+    sessionStorage.setItem('ba_session_id', sid);
+  }
+  return sid;
+}
 
 // =============================================================================
 // PoV 추천 검색어 (오른쪽 사이드바에 표시)
@@ -89,8 +102,9 @@ function ScoreBar({ score, maxScore, colorClass = 'bg-blue-400' }) {
 
 // =============================================================================
 // 검색 결과 카드
+// lastQuery / searchType을 prop으로 받아 클릭 이벤트 전송에 활용합니다.
 // =============================================================================
-function ResultCard({ hit, index: idx, searchType, maxScore }) {
+function ResultCard({ hit, index: idx, searchType, maxScore, lastQuery }) {
   const [expanded, setExpanded] = useState(false);
 
   const highlightTitle   = hit.highlight?.title?.[0];
@@ -100,8 +114,28 @@ function ResultCard({ hit, index: idx, searchType, maxScore }) {
     ? (hit.content.length > 150 ? hit.content.slice(0, 150) + '…' : hit.content)
     : '';
 
+  // ── Behavioral Analytics: click 이벤트 ──────────────────────────────────
+  const handleCardClick = () => {
+    sendAnalyticsEvent('click', {
+      search: {
+        query:       lastQuery,
+        search_type: searchType,
+      },
+      document: {
+        id:    hit.id ?? hit.title ?? String(idx),
+        index: 'enterprise-knowledge',
+      },
+      page:    { current: 1 },
+      session: { id: getSessionId() },
+    });
+  };
+  // ────────────────────────────────────────────────────────────────────────
+
   return (
-    <div className="p-4 bg-white border border-gray-200 rounded-lg shadow-sm hover:shadow-md transition-shadow">
+    <div
+      className="p-4 bg-white border border-gray-200 rounded-lg shadow-sm hover:shadow-md transition-shadow cursor-pointer"
+      onClick={handleCardClick}
+    >
       {/* 제목 + 스코어 */}
       <div className="flex justify-between items-start mb-1 gap-2">
         <h3
@@ -145,7 +179,7 @@ function ResultCard({ hit, index: idx, searchType, maxScore }) {
           </p>
           {hit.content && hit.content.length > 150 && (
             <button
-              onClick={() => setExpanded(!expanded)}
+              onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
               className="mt-1 text-xs text-blue-500 hover:text-blue-700 flex items-center gap-0.5"
             >
               <ChevronDown className={`w-3 h-3 transition-transform ${expanded ? 'rotate-180' : ''}`} />
@@ -169,7 +203,7 @@ function ResultCard({ hit, index: idx, searchType, maxScore }) {
 // 3-way 비교용 컴팩트 카드
 // commonLevel: 0 = 단독, 2 = 2가지 방식 공통 (amber), 3 = 3가지 모두 공통 (blue)
 // =============================================================================
-function CompareCard({ hit, commonLevel = 0, barColor, maxScore }) {
+function CompareCard({ hit, commonLevel = 0, barColor, maxScore, lastQuery, colSearchType }) {
   const highlightTitle = hit.highlight?.title?.[0];
   const contentPreview = hit.content
     ? (hit.content.length > 100 ? hit.content.slice(0, 100) + '…' : hit.content)
@@ -184,8 +218,28 @@ function CompareCard({ hit, commonLevel = 0, barColor, maxScore }) {
     commonLevel === 3 ? 'text-blue-500 fill-blue-500' :
     'text-amber-500 fill-amber-500';
 
+  // ── Behavioral Analytics: click 이벤트 (compare 모드) ───────────────────
+  const handleCardClick = () => {
+    sendAnalyticsEvent('click', {
+      search: {
+        query:       lastQuery,
+        search_type: colSearchType,   // 어느 컬럼에서 클릭했는지 구분
+      },
+      document: {
+        id:    hit.id ?? hit.title ?? '',
+        index: 'enterprise-knowledge',
+      },
+      page:    { current: 1 },
+      session: { id: getSessionId() },
+    });
+  };
+  // ────────────────────────────────────────────────────────────────────────
+
   return (
-    <div className={`p-3 rounded-lg border text-sm hover:shadow-sm transition-shadow ${cardStyle}`}>
+    <div
+      className={`p-3 rounded-lg border text-sm hover:shadow-sm transition-shadow cursor-pointer ${cardStyle}`}
+      onClick={handleCardClick}
+    >
       <div className="flex justify-between items-start gap-1 mb-0.5">
         <h4
           className="font-medium text-gray-900 leading-snug text-xs flex-1"
@@ -214,8 +268,7 @@ function CompareCard({ hit, commonLevel = 0, barColor, maxScore }) {
 // =============================================================================
 // 3-way 비교 뷰
 // =============================================================================
-function CompareView({ lexical, vector, hybrid }) {
-  // 각 제목이 몇 개의 컬럼에 등장하는지 카운트 (중복 제거 후)
+function CompareView({ lexical, vector, hybrid, lastQuery }) {
   const titleSetCount = new Map();
   for (const titleSet of [
     new Set(lexical.map((h) => h.title)),
@@ -227,7 +280,6 @@ function CompareView({ lexical, vector, hybrid }) {
     }
   }
 
-  // commonLevel: 3 = 모든 방식, 2 = 2가지 방식, 0 = 단독
   const getCommonLevel = (title) => titleSetCount.get(title) ?? 0;
 
   const count3 = [...titleSetCount.values()].filter((c) => c === 3).length;
@@ -249,7 +301,7 @@ function CompareView({ lexical, vector, hybrid }) {
     },
     {
       key:        'vector',
-      label:      'Vector (Semantic)',
+      label:      'Vector (Semantic / Jina v5)',
       hits:       vector,
       maxScore:   maxVec,
       labelColor: 'text-purple-700',
@@ -305,6 +357,8 @@ function CompareView({ lexical, vector, hybrid }) {
                   commonLevel={getCommonLevel(hit.title)}
                   barColor={col.barColor}
                   maxScore={col.maxScore}
+                  lastQuery={lastQuery}
+                  colSearchType={col.key}
                 />
               ))}
             </div>
@@ -367,9 +421,9 @@ const ERROR_SCENARIOS = [
 ];
 
 function ErrorTestPanel() {
-  const [open,   setOpen]   = useState(false);
-  const [result, setResult] = useState(null); // { ok, message }
-  const [running, setRunning] = useState(null); // scenario id
+  const [open,    setOpen]    = useState(false);
+  const [result,  setResult]  = useState(null);
+  const [running, setRunning] = useState(null);
 
   const run = (scenario) => {
     setRunning(scenario.id);
@@ -386,7 +440,6 @@ function ErrorTestPanel() {
       }
 
       if (scenario.id === 'frontend-unhandled') {
-        // catch 없는 Promise.reject → APM RUM이 window.onunhandledrejection으로 자동 캡처
         Promise.reject(
           new Error(`[APM 테스트] Unhandled Promise Rejection — ${new Date().toISOString()}`)
         );
@@ -480,13 +533,33 @@ function ErrorTestPanel() {
 
 // =============================================================================
 // 챗봇 패널
+//
+// APM 계측 구조 (RUM — 프론트엔드에서 측정 가능한 구간):
+//
+//   transaction: Chat:send              ← 전체 메시지 송수신 트랜잭션 (기존 유지)
+//
+//   span: chat:fetch-to-first-chunk     ← fetch() 호출 시작 ~ 첫 SSE chunk 수신까지
+//                                          (네트워크 왕복 + 백엔드 전체 처리 대기)
+//                                          백엔드 APM의 chat:llm-ttfb와 쌍을 이룸
+//
+//   span: chat:stream-duration          ← 첫 chunk 수신 ~ done 이벤트까지
+//                                          (LLM 토큰 생성 + 스트리밍 전송 구간)
+//
+//   label: chat.ttfb_ms                 ← fetch-to-first-chunk 소요 ms (숫자)
+//   label: chat.total_ms                ← fetch 시작 ~ done 완료 소요 ms (숫자)
+//   label: chat.is_followup             ← 대화 이어가기 여부
+//   label: chat.input_length            ← 입력 문자 수
+//
+// Kibana APM > Transactions > Chat:send > Timeline에서
+// RUM span과 백엔드 span이 하나의 분산 추적 waterfall로 연결됩니다.
+// (distributed tracing: traceparent 헤더로 RUM ↔ Node.js APM 연결)
 // =============================================================================
 function ChatPanel({ onClose }) {
-  const [messages, setMessages]       = useState([
+  const [messages, setMessages]             = useState([
     { role: 'assistant', text: '안녕하세요! 사내 지식 검색 AI 어시스턴트입니다. 무엇이든 물어보세요.' },
   ]);
-  const [input, setInput]             = useState('');
-  const [loading, setLoading]         = useState(false);
+  const [input,          setInput]          = useState('');
+  const [loading,        setLoading]        = useState(false);
   const [conversationId, setConversationId] = useState(null);
   const bottomRef = useRef(null);
 
@@ -502,10 +575,17 @@ function ChatPanel({ onClose }) {
     setMessages((prev) => [...prev, { role: 'user', text }]);
     setLoading(true);
 
-    const tx = apm.startTransaction('Chat:send', 'user-interaction');
+    // ── 트랜잭션 시작 (기존 유지) ──────────────────────────────────────────
+    const tx = apm.startTransaction('Chat:send', 'user-interaction', { managed: true });
     tx?.addLabels({ is_followup: !!conversationId, input_length: text.length });
 
     setMessages((prev) => [...prev, { role: 'assistant', text: '', streaming: true }]);
+
+    // ── 타이밍 추적용 변수 ─────────────────────────────────────────────────
+    const fetchStartTime   = Date.now();
+    let   spanFetchToChunk = apm.startSpan('chat:fetch-to-first-chunk', 'external', { blocking: true });
+    let   spanStream       = null;
+    let   firstChunkSeen   = false;
 
     try {
       const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/chat`, {
@@ -537,6 +617,18 @@ function ChatPanel({ onClose }) {
           try { data = JSON.parse(dataMatch[1]); } catch { continue; }
 
           if (event === 'chunk') {
+            // ── 첫 chunk 수신 시점: fetch-to-first-chunk span 종료 ──────────
+            if (!firstChunkSeen) {
+              firstChunkSeen = true;
+              const ttfbMs = Date.now() - fetchStartTime;
+              tx?.addLabels({ chat_ttfb_ms: ttfbMs });
+              spanFetchToChunk?.end();
+              spanFetchToChunk = null;
+
+              // ── stream-duration span 시작 (첫 chunk ~ done) ────────────────
+              spanStream = apm.startSpan('chat:stream-duration', 'external');
+            }
+
             setMessages((prev) => {
               const next = [...prev];
               const last = { ...next[next.length - 1] };
@@ -544,7 +636,13 @@ function ChatPanel({ onClose }) {
               next[next.length - 1] = last;
               return next;
             });
+
           } else if (event === 'done') {
+            // ── done 수신 시점: stream-duration span 종료 + 총 시간 기록 ────
+            spanStream?.end();
+            spanStream = null;
+            tx?.addLabels({ chat_total_ms: Date.now() - fetchStartTime });
+
             if (data.conversation_id) setConversationId(data.conversation_id);
             setMessages((prev) => {
               const next = [...prev];
@@ -553,6 +651,7 @@ function ChatPanel({ onClose }) {
               next[next.length - 1] = last;
               return next;
             });
+
           } else if (event === 'error') {
             setMessages((prev) => {
               const next = [...prev];
@@ -581,6 +680,9 @@ function ChatPanel({ onClose }) {
         return next;
       });
     } finally {
+      // 비정상 종료 시 열려있는 span 안전하게 닫기
+      spanFetchToChunk?.end();
+      spanStream?.end();
       setLoading(false);
       tx?.end();
     }
@@ -651,21 +753,12 @@ function ChatPanel({ onClose }) {
 // =============================================================================
 // 추천 검색어 사이드바
 // =============================================================================
-// 각 추천 검색어에 대해 어느 검색 방식이 유리한지 표시
-// (실제 검색 결과 비교를 통해 도출 — FORK/FUSE/RERANK 적용 후 재검증)
-//
-// #1 비밀번호 만료   → Lexical: 정확한 "만료·비밀번호" 키워드 매칭으로 1위 직행
-// #2 계정 보안 강화  → Vector:  "보안 강화" = MFA + 비밀번호 정책 의미론적 탐색
-// #3 피싱 의심 메일  → Lexical: "피싱 이메일 신고 방법" 정확 매칭 1위
-// #4 신입사원 첫날   → Hybrid:  FORK(키워드·시맨틱) → FUSE → RERANK로 정확 반환
-// #5 연차/반차 신청  → Lexical: 두 개의 정확한 휴가 문서 동시 매칭
-// #6 보안 사고 신고  → 3-way 비교 추천: 각 방식이 서로 다른 관련 문서를 반환해 차이가 두드러짐
 const SUGGESTION_HINTS = [
-  { label: 'Lexical 유리', color: 'text-green-700 bg-green-100' },
-  { label: 'Vector 유리',  color: 'text-purple-700 bg-purple-100' },
-  { label: 'Lexical 유리', color: 'text-green-700 bg-green-100' },
-  { label: 'Hybrid 유리',  color: 'text-blue-700 bg-blue-100' },
-  { label: 'Lexical 유리', color: 'text-green-700 bg-green-100' },
+  { label: 'Lexical 유리',    color: 'text-green-700 bg-green-100' },
+  { label: 'Vector 유리',     color: 'text-purple-700 bg-purple-100' },
+  { label: 'Lexical 유리',    color: 'text-green-700 bg-green-100' },
+  { label: 'Hybrid 유리',     color: 'text-blue-700 bg-blue-100' },
+  { label: 'Lexical 유리',    color: 'text-green-700 bg-green-100' },
   { label: '3-way 비교 추천', color: 'text-orange-700 bg-orange-100' },
 ];
 
@@ -715,10 +808,13 @@ export default function SearchPage() {
   const [error,          setError]          = useState(null);
   const [showChat,       setShowChat]       = useState(false);
 
-  const currentMode  = SEARCH_MODES.find((m) => m.id === searchType);
-  const isCompare    = searchType === 'compare';
+  // ── lastQuery: ResultCard / CompareCard의 click 이벤트에서 검색어를 참조하기 위해 별도 보관
+  const [lastQuery, setLastQuery] = useState('');
 
-  // 실제 검색 로직 — form submit과 추천 클릭 모두 이 함수를 사용
+  const currentMode = SEARCH_MODES.find((m) => m.id === searchType);
+  const isCompare   = searchType === 'compare';
+
+  // ── 실제 검색 로직 ──────────────────────────────────────────────────────────
   const doSearch = async (q, type) => {
     if (!q.trim()) return;
     setLoading(true);
@@ -726,6 +822,7 @@ export default function SearchPage() {
     setResults(null);
     setCompareResults(null);
     setFacets(null);
+    setLastQuery(q);   // click 이벤트에서 사용
 
     // ── 3-way 비교 모드 ──
     if (type === 'compare') {
@@ -737,6 +834,28 @@ export default function SearchPage() {
           search(q, 'vector',  'enterprise-knowledge', COMPARE_SIZE),
           search(q, 'hybrid',  'enterprise-knowledge', COMPARE_SIZE),
         ]);
+
+        // ── Behavioral Analytics: compare 모드 search 이벤트 (3건 병렬 전송) ──
+        const sid = getSessionId();
+        ['lexical', 'vector', 'hybrid'].forEach((st, i) => {
+          const data = [lex, vec, hyb][i];
+          sendAnalyticsEvent('search', {
+            search: {
+              query:        q,
+              search_type:  st,
+              results: {
+                total_results: data.total ?? 0,
+                items: (data.hits ?? []).slice(0, 5).map((hit) => ({
+                  document: { id: hit.id ?? hit.title, index: 'enterprise-knowledge' },
+                  page:     { current: 1 },
+                })),
+              },
+            },
+            session: { id: sid },
+          });
+        });
+        // ────────────────────────────────────────────────────────────────────
+
         setCompareResults({ lexical: lex.hits, vector: vec.hits, hybrid: hyb.hits });
         tx?.addLabels({
           lex_count: lex.hits.length,
@@ -761,6 +880,24 @@ export default function SearchPage() {
       setResults(data);
       setFacets(data.facets ?? null);
       tx?.addLabels({ result_count: data.hits?.length ?? 0, took_ms: data.took ?? 0 });
+
+      // ── Behavioral Analytics: search 이벤트 ──────────────────────────────
+      sendAnalyticsEvent('search', {
+        search: {
+          query:        q,
+          search_type:  type,
+          results: {
+            total_results: data.total ?? 0,
+            items: (data.hits ?? []).slice(0, 5).map((hit) => ({
+              document: { id: hit.id ?? hit.title, index: 'enterprise-knowledge' },
+              page:     { current: 1 },
+            })),
+          },
+        },
+        session: { id: getSessionId() },
+      });
+      // ────────────────────────────────────────────────────────────────────
+
     } catch (err) {
       apm.captureError(err);
       setError(err.response?.data?.error || err.message);
@@ -792,9 +929,8 @@ export default function SearchPage() {
             Enterprise Knowledge Search
           </h1>
           <p className="text-gray-500 text-sm">
-            Elastic Hybrid Search Demo · BM25 + Semantic + RERANK
+            Elastic Hybrid Search Demo · BM25 + Jina v5 Semantic + RERANK
           </p>
-          {/* 에러 시뮬레이션 버튼 — 우상단에 위치 */}
           <div className="absolute top-0 right-0">
             <ErrorTestPanel />
           </div>
@@ -870,9 +1006,7 @@ export default function SearchPage() {
             {compareResults && (
               <div>
                 <div className="flex items-center justify-between mb-3">
-                  <p className="text-sm text-gray-500">
-                    3가지 검색 방식 비교 결과
-                  </p>
+                  <p className="text-sm text-gray-500">3가지 검색 방식 비교 결과</p>
                   <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
                     3-way 비교
                   </span>
@@ -881,6 +1015,7 @@ export default function SearchPage() {
                   lexical={compareResults.lexical}
                   vector={compareResults.vector}
                   hybrid={compareResults.hybrid}
+                  lastQuery={lastQuery}
                 />
               </div>
             )}
@@ -911,6 +1046,7 @@ export default function SearchPage() {
                         index={i}
                         searchType={searchType}
                         maxScore={maxScore}
+                        lastQuery={lastQuery}
                       />
                     ))}
                   </div>
